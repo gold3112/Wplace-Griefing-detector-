@@ -1,357 +1,492 @@
 import tkinter as tk
-from tkinter import ttk # 追加
-from PIL import Image, ImageTk, ImageChops
+from tkinter import ttk
+from PIL import Image, ImageTk, ImageChops, ImageOps, ImageEnhance
 import requests
 import io
 import time
 import os
+import threading
+import datetime as dt
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# 日本語フォントの設定 (Windowsの場合、'Meiryo'などが利用可能)
+# ---- 表示用フォント（Windowsなら Meiryo が無難） ----
 plt.rcParams['font.family'] = 'Meiryo'
-plt.rcParams['axes.unicode_minus'] = False # 負の符号を正しく表示
+plt.rcParams['axes.unicode_minus'] = False
 
-# --- 設定 ---
-# 監視するタイルのURL
+# ---- 設定 ----
 TILE_URL = "https://backend.wplace.live/files/s0/tiles/1819/806.png"
-# 菊の紋章の原本画像のファイルパス
 SEAL_IMAGE_PATH = "kiku.png"
-# 変更を検知するしきい値（0〜100のパーセンテージ）。
-CHANGE_THRESHOLD = 8.0
-# チェック間隔（ミリ秒）
 CHECK_INTERVAL_MS = 1000
 
+# 監視領域（タイル内座標）とテンプレ領域（原本内）
+MONITOR_CROP = (0, 391, 73, 464)    # w=73, h=73
+SEAL_CROP    = (11, 32, 84, 105)    # w=73, h=73
+
+# レベル別しきい値初期値（％）
+# 閾値が低い順に並べてください
+VANDALISM_LEVELS = [
+    (25.0, "軽度"),
+    (50.0, "中度"),
+    (75.0, "重度")
+]
+
+# ---- ユーティリティ ----
 def get_image_from_url(url):
-    """URLから画像をダウンロードし、PillowのImageオブジェクトとして返す"""
+    """URLから画像を取得してPIL Imageオブジェクトとして返す"""
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        return Image.open(io.BytesIO(response.content)).convert("RGB")
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return Image.open(io.BytesIO(r.content)).convert("RGB")
     except requests.exceptions.RequestException as e:
-        print(f"画像のダウンロード中にエラーが発生しました: {e}")
+        print(f"[network] 画像取得エラー: {e}")
+        return None
+    except OSError as e:
+        print(f"[decode] 画像デコードエラー: {e}")
         return None
 
 def compare_images(img1, img2):
-    """2つの画像を比較し、異なるピクセルの割合（%）と差分画像を返す"""
+    """差分画像と異なる画素割合[%]を返す。"""
     if img1.size != img2.size:
-        # サイズが違う場合、小さい方に合わせてクロップ（フォールバック）
-        min_width = min(img1.width, img2.width)
-        min_height = min(img1.height, img2.height)
-        img1 = img1.crop((0, 0, min_width, min_height))
-        img2 = img2.crop((0, 0, min_width, min_height))
-
+        w = min(img1.width, img2.width)
+        h = min(img1.height, img2.height)
+        img1 = img1.crop((0, 0, w, h))
+        img2 = img2.crop((0, 0, w, h))
     diff = ImageChops.difference(img1, img2)
-    if diff.getbbox() is None:
+    bbox = diff.getbbox()
+    if not bbox:
         return 0.0, diff
+    nonzero = sum(1 for p in diff.getdata() if p != (0, 0, 0))
+    return (nonzero / (diff.width * diff.height)) * 100.0, diff
 
-    diff_non_zero = 0
-    for pixel in diff.getdata():
-        if pixel != (0, 0, 0):
-            diff_non_zero += 1
-            
-    total_pixels = img1.width * img1.height
-    if total_pixels == 0:
-        return 0.0, diff
-    
-    percentage_diff = (diff_non_zero / total_pixels) * 100
-    return percentage_diff, diff
-
+# ---- アプリ ----
 class VandalismDetectorApp:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("wplace 荒らし検出")
-        self.root.attributes('-fullscreen', True) # 最初から全画面表示
-        self.root.configure(bg='black') # 背景色を黒に設定
 
-        # ttkスタイルを適用
-        style = ttk.Style()
-        style.theme_use('clam') # 'clam', 'alt', 'default', 'classic' など
-        # 黒背景に合うようにスタイルを調整
-        style.configure('TLabel', background='#1a1a1a', foreground='#e0e0e0', font=("Helvetica", 14))
-        style.configure('TFrame', background='#1a1a1a')
-        style.configure('TButton', background='#333333', foreground='#e0e0e0', font=("Helvetica", 12), borderwidth=0, focusthickness=3, focuscolor='#007bff') # ボタンのスタイル
-        style.map('TButton', background=[('active', '#555555')], foreground=[('active', 'white')]) # ボタンのアクティブ時の色
-        style.configure('TEntry', fieldbackground='#333333', foreground='#e0e0e0', insertbackground='#e0e0e0', borderwidth=1, relief="flat") # エントリーのスタイル
-        style.map('TEntry', fieldbackground=[('focus', '#444444')])
+        # フルスクリーン管理
+        self.is_fullscreen = False
+        self.windowed_geometry = '1280x800'
+        self.root.geometry(self.windowed_geometry)
+        self.root.bind('<F11>', self.toggle_fullscreen)
+        self.root.bind('<Alt-Return>', self.toggle_fullscreen)
+        self.root.bind('<Escape>', self.exit_fullscreen)
 
-        # スクロールバーのスタイル (もし将来的に必要になった場合)
-        style.configure('TScrollbar', troughcolor='#333333', background='#555555', borderwidth=0)
-        style.map('TScrollbar', background=[('active', '#777777')])
+        # 集中表示（UI最小化）
+        self.focus_mode = False
+        self.root.bind('<F2>', self.toggle_focus_mode)
 
-        # 状態表示ラベルのスタイル
-        style.configure('Status.TLabel', background='#1a1a1a', foreground='#00ff00', font=("Helvetica", 20, "bold"), padding=15)
-        style.map('Status.TLabel', foreground=[('active', '#00ff00'), ('!disabled', '#00ff00')], background=[('active', '#1a1a1a'), ('!disabled', '#1a1a1a')])
+        # 状態
+        self.monitoring = True
+        self.start_time = time.time()
+        self.last_snapshot = None
 
-        # 画像フレーム内のラベルスタイル
-        style.configure('ImageTitle.TLabel', background='#1a1a1a', foreground='#e0e0e0', font=("Helvetica", 16, "bold"))
+        # 監視用ベースサイズ
+        self.base_w = MONITOR_CROP[2] - MONITOR_CROP[0]
+        self.base_h = MONITOR_CROP[3] - MONITOR_CROP[1]
 
-        # 情報表示フレーム内のラベルスタイル
-        style.configure('Info.TLabel', background='#1a1a1a', foreground='#e0e0e0', font=("Helvetica", 12))
+        # 画質関連の設定値
+        self.scale_preference = tk.IntVar(value=8)  # ユーザー希望倍率（1〜20）
+        self.render_mode_var = tk.StringVar(value='Pixel-Perfect')
+        self.enhance_diff_var = tk.BooleanVar(value=True)
 
-        self.seal_image = self.load_and_prepare_seal_image()
-        if not self.seal_image:
-            root.destroy()
-            return
+        # 検知パラメータ
+        self.threshold_vars = [tk.StringVar(value=str(v[0])) for v in VANDALISM_LEVELS]
+        self.check_interval_var = tk.StringVar(value=str(CHECK_INTERVAL_MS // 1000))
 
-        self.DISPLAY_IMAGE_SIZE = (450, 450) # 表示する画像のサイズをさらに大きく (73*約6.16)
+        # 表示・統計
+        self.uptime_var = tk.StringVar(value='00:00:00')
+        self.status_var = tk.StringVar(value='初期化中...')
+        self.status_color = '#00c853'
+        self.total_detections = 0
+        self.last_detection_time = tk.StringVar(value='なし')
 
-        # パラメータ用のStringVarを初期化 (Entry用なのでStringVar)
-        self.change_threshold_var = tk.StringVar(value=str(CHANGE_THRESHOLD))
-        self.check_interval_var = tk.StringVar(value=str(CHECK_INTERVAL_MS // 1000)) # 秒単位で扱う
-
-        # 追加情報表示用のStringVarを初期化
-        self.last_detection_time_var = tk.StringVar(value="なし")
-        self.total_detections_var = tk.IntVar(value=0)
-        self.current_tile_url_var = tk.StringVar(value=TILE_URL)
-        self.seal_image_path_var = tk.StringVar(value="読み込み中...")
-        self.uptime_var = tk.StringVar(value="00:00:00")
-        self.start_time = time.time() # 稼働時間計算用
-
-        # グラフ用の設定
+        # グラフ準備
         self.diff_history = []
         self.time_history = []
-        self.fig, self.ax = plt.subplots(figsize=(5, 3), dpi=100)
-        self.ax.set_title("差分パーセンテージの推移")
-        self.ax.set_xlabel("時間 (秒)")
-        self.ax.set_ylabel("差分 (%)")
-        self.ax.set_ylim(0, 100) # 0%から100%の範囲で固定
-        self.ax.set_facecolor('black') # グラフの背景色を黒に
-        self.fig.patch.set_facecolor('black') # Figureの背景色も黒に
-        self.ax.tick_params(axis='x', colors='white') # x軸の目盛り色を白に
-        self.ax.tick_params(axis='y', colors='white') # y軸の目盛り色を白に
-        self.ax.spines['bottom'].set_color('white') # 下の枠線を白に
-        self.ax.spines['top'].set_color('white') # 上の枠線を白に
-        self.ax.spines['right'].set_color('white') # 右の枠線を白に
-        self.ax.spines['left'].set_color('white') # 左の枠線を白に
-        self.ax.title.set_color('white') # タイトル色を白に
-        self.ax.xaxis.label.set_color('white') # x軸ラベル色を白に
-        self.ax.yaxis.label.set_color('white') # y軸ラベル色を白に
+        self.fig, self.ax = plt.subplots(figsize=(5.4, 3.2), dpi=100)
+        self._style_matplotlib()
+        self.canvas_mpl = None
 
-        self.status_var = tk.StringVar()
-        self.status_var.set("初期化中...")
+        # 画像プレースホルダ & 最新イメージ保持（リサイズ再描画用）
+        self.photo_realtime = None
+        self.photo_diff = None
+        self._last_area = None
+        self._last_diff = None
 
-        self.setup_gui() # GUIのセットアップを呼び出す
-        self.perform_check() # 最初のチェックを開始
-        self.update_uptime_display() # 稼働時間表示の更新を開始
-
-    def setup_gui(self):
-        """GUIのウィジェットをセットアップする"""
-        # グリッドレイアウトの設定
-        self.root.grid_rowconfigure(0, weight=0) # ステータスラベルは固定
-        self.root.grid_rowconfigure(1, weight=1) # 画像フレームはリサイズに追従
-        self.root.grid_rowconfigure(2, weight=0) # パラメータフレームは固定
-        self.root.grid_rowconfigure(3, weight=0) # 情報表示フレームは固定
-        self.root.grid_columnconfigure(0, weight=1) # 中央に配置
-
-        self.status_label = ttk.Label(self.root, textvariable=self.status_var, style='Status.TLabel')
-        self.status_label.grid(row=0, column=0, pady=10)
-
-        self.image_frame = ttk.Frame(self.root, padding=10)
-        self.image_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
-        
-        # image_frame内のグリッド設定
-        self.image_frame.grid_columnconfigure(0, weight=1)
-        self.image_frame.grid_columnconfigure(1, weight=1)
-        self.image_frame.grid_columnconfigure(2, weight=1) # グラフ用の新しいカラム
-        self.image_frame.grid_rowconfigure(0, weight=1)
-
-        self.realtime_frame = ttk.Frame(self.image_frame)
-        self.realtime_frame.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
-        ttk.Label(self.realtime_frame, text="リアルタイム", style='ImageTitle.TLabel').pack()
-        self.realtime_image_label = ttk.Label(self.realtime_frame)
-        self.realtime_image_label.pack()
-
-        self.diff_frame = ttk.Frame(self.image_frame)
-        self.diff_frame.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
-        ttk.Label(self.diff_frame, text="差分", style='ImageTitle.TLabel').pack()
-        self.diff_image_label = ttk.Label(self.diff_frame)
-        self.diff_image_label.pack()
-
-        # プレースホルダー画像を新しいサイズで作成
-        placeholder = ImageTk.PhotoImage(Image.new('RGB', self.DISPLAY_IMAGE_SIZE, 'gray'))
-        self.realtime_image_label.config(image=placeholder)
-        self.diff_image_label.config(image=placeholder)
-        self.realtime_image_label.image = placeholder
-        self.diff_image_label.image = placeholder
-
-        # グラフ表示用のフレーム
-        self.graph_frame = ttk.Frame(self.image_frame)
-        self.graph_frame.grid(row=0, column=2, sticky="nsew", padx=10, pady=10) # 新しいカラムを追加
-        ttk.Label(self.graph_frame, text="差分グラフ", style='ImageTitle.TLabel').pack()
-        
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.graph_frame)
-        self.canvas_widget = self.canvas.get_tk_widget()
-        self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=1)
-        self.canvas.draw()
-
-        # パラメータ調整用のフレーム
-        self.param_frame = ttk.Frame(self.root, padding=10)
-        self.param_frame.grid(row=2, column=0, pady=10)
-        self.param_frame.grid_columnconfigure(0, weight=1)
-        self.param_frame.grid_columnconfigure(1, weight=1)
-        self.param_frame.grid_columnconfigure(2, weight=1)
-        self.param_frame.grid_columnconfigure(3, weight=1)
-
-        # しきい値入力
-        ttk.Label(self.param_frame, text="しきい値 (%):", style='Info.TLabel').grid(row=0, column=0, sticky="w")
-        self.threshold_entry = ttk.Entry(self.param_frame, textvariable=self.change_threshold_var, width=10)
-        self.threshold_entry.grid(row=0, column=1, sticky="w")
-        # 入力検証コマンドを設定
-        vcmd_threshold = (self.root.register(self.validate_threshold_input), '%P')
-        self.threshold_entry.config(validate="key", validatecommand=vcmd_threshold)
-
-        # チェック間隔入力
-        ttk.Label(self.param_frame, text="チェック間隔 (秒):").grid(row=1, column=0, sticky="w")
-        self.interval_entry = ttk.Entry(self.param_frame, textvariable=self.check_interval_var, width=10)
-        self.interval_entry.grid(row=1, column=1, sticky="w")
-        # 入力検証コマンドを設定
-        vcmd_interval = (self.root.register(self.validate_interval_input), '%P')
-        self.interval_entry.config(validate="key", validatecommand=vcmd_interval)
-
-        # 情報表示用のフレーム
-        self.info_frame = ttk.Frame(self.root, padding=10)
-        self.info_frame.grid(row=3, column=0, pady=10)
-        self.info_frame.grid_columnconfigure(0, weight=1)
-        self.info_frame.grid_columnconfigure(1, weight=1)
-
-        ttk.Label(self.info_frame, text="稼働時間:", style='Info.TLabel').grid(row=0, column=0, sticky="w")
-        ttk.Label(self.info_frame, textvariable=self.uptime_var, style='Info.TLabel').grid(row=0, column=1, sticky="w")
-
-        # 制作者情報
-        ttk.Label(self.root, text="Wplace皇居荒らし監視tool　　制作者:AI(Gemini)とGOLD", style='Info.TLabel').grid(row=4, column=0, pady=5)
-        self.info_frame.grid_columnconfigure(2, weight=1)
-        self.info_frame.grid_columnconfigure(3, weight=1)
-
-        ttk.Label(self.info_frame, text="稼働時間:").grid(row=0, column=0, sticky="w")
-        ttk.Label(self.info_frame, textvariable=self.uptime_var).grid(row=0, column=1, sticky="w")
-
-    def validate_threshold_input(self, p):
-        # しきい値入力の検証 (0-100の浮動小数点数)
-        if p == "":
-            return True # 空欄は許可 (後でデフォルト値が適用されるため)
-        try:
-            value = float(p)
-            return 0.0 <= value <= 100.0
-        except ValueError:
-            return False
-
-    def validate_interval_input(self, p):
-        # チェック間隔入力の検証 (正の整数)
-        if p == "":
-            return True # 空欄は許可
-        try:
-            value = int(p)
-            return value > 0
-        except ValueError:
-            return False
-
-    def load_and_prepare_seal_image(self):
-        """原本画像を読み込み、補正する"""
-        try:
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-        except NameError:
-            script_dir = os.getcwd()
-        
-        seal_image_abs_path = os.path.join(script_dir, SEAL_IMAGE_PATH)
-
-        if not os.path.exists(seal_image_abs_path):
-            print(f"エラー: 原本画像 '{seal_image_abs_path}' が見つかりません。")
-            print(f"スクリプトと同じフォルダに '{SEAL_IMAGE_PATH}' を置いてください。")
-            return None
-        try:
-            seal_image_original = Image.open(seal_image_abs_path).convert("RGB")
-            crop_box = (11, 32, 84, 105)
-            seal_image = seal_image_original.crop(crop_box)
-            print("原本画像の読み込みと補正に成功しました。")
-            return seal_image
-        except Exception as e:
-            print(f"原本画像の読み込みエラー: {e}")
-            return None
-
-    def update_threshold_label(self, value):
-        self.threshold_label.config(text=f"{float(value):.1f}")
-
-    def update_interval_label(self, value):
-        self.interval_label.config(text=f"{int(float(value))}")
-
-    def perform_check(self):
-        """画像の取得、比較、GUIの更新を行う"""
-        # スライダーから現在のしきい値とチェック間隔を取得
-        current_threshold = float(self.change_threshold_var.get())
-        current_check_interval_ms = int(float(self.check_interval_var.get())) * 1000 # 秒をミリ秒に変換
-
-        current_tile_image = get_image_from_url(TILE_URL)
-        if not current_tile_image:
-            self.status_var.set("エラー: タイル画像取得失敗")
-            self.root.after(current_check_interval_ms, self.perform_check)
+        # テンプレ画像
+        self.seal_image = self._load_seal()
+        if not self.seal_image:
+            self._fatal("原本 kiku.png が見つかりません。スクリプトと同じフォルダに配置してください。")
             return
 
-        monitoring_area_coords = (0, 391, 73, 464)
-        current_monitored_area = current_tile_image.crop(monitoring_area_coords)
+        # UI 構築
+        self._build_styles()
+        self._build_ui()
+
+        # リサイズに応じた再描画
+        self.root.bind('<Configure>', self._on_any_configure)
+
+        # 監視ループ開始
+        self.root.after(200, self._tick_uptime)
+        self.root.after(0, self.perform_check)
+
+    # ---------- UI 構築 ----------
+    def _build_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+        bg = '#0f1115'; fg = '#e6e6e6'; acc = '#2d333b'; green = '#00c853'; red = '#ff5252'
+        self.COLORS = dict(bg=bg, fg=fg, acc=acc, green=green, red=red)
+        self.root.configure(bg=bg)
+        style.configure('.', background=bg, foreground=fg)
+        style.configure('TFrame', background=bg)
+        style.configure('TLabel', background=bg, foreground=fg)
+        style.configure('Header.TLabel', font=('Segoe UI', 14, 'bold'))
+        style.configure('Status.TLabel', font=('Segoe UI', 12))
+        style.configure('Title.TLabel', font=('Segoe UI', 16, 'bold'))
+        style.configure('Pct.TLabel', font=('Segoe UI', 28, 'bold'))
+        style.configure('PctBig.TLabel', font=('Segoe UI', 44, 'bold'))
+        style.configure('Card.TFrame', background=acc)
+        style.configure('CardTitle.TLabel', background=acc, foreground=fg, font=('Segoe UI', 12, 'bold'))
+        style.configure('TEntry', fieldbackground=acc)
+        style.configure('TCheckbutton', background=bg, foreground=fg)
+
+    def _build_ui(self):
+        # ヘッダー
+        self.header = ttk.Frame(self.root, padding=(12, 8))
+        self.header.grid(row=0, column=0, sticky='ew')
+        self.header.grid_columnconfigure(1, weight=1)
+        ttk.Label(self.header, text='wplace 荒らし検出', style='Title.TLabel').grid(row=0, column=0, sticky='w')
+        self.dot = ttk.Label(self.header, text='●', foreground=self.status_color, style='Title.TLabel')
+        self.dot.grid(row=0, column=1, sticky='e', padx=(0, 8))
+        ttk.Button(self.header, text='全画面 (F11)', command=self.toggle_fullscreen).grid(row=0, column=2, padx=4)
+        ttk.Button(self.header, text='集中表示 (F2)', command=self.toggle_focus_mode).grid(row=0, column=3, padx=4)
+
+        # メイン
+        self.main = ttk.Frame(self.root, padding=10)
+        self.main.grid(row=1, column=0, sticky='nsew')
+        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        self.main.grid_columnconfigure(0, weight=1)
+        self.main.grid_columnconfigure(1, weight=1)
+        self.main.grid_columnconfigure(2, weight=1)
+        self.main.grid_rowconfigure(1, weight=1)
+
+        # カード: リアルタイム
+        card_rt = self._card(self.main, 'リアルタイム', row=1, col=0)
+        self.rt_container = ttk.Frame(card_rt, style='TFrame')
+        self.rt_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.lbl_rt = ttk.Label(self.rt_container)
+        self.lbl_rt.pack(expand=True)
+
+        # カード: 差分
+        card_df = self._card(self.main, '差分', row=1, col=1)
+        self.df_container = ttk.Frame(card_df, style='TFrame')
+        self.df_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.lbl_diff = ttk.Label(self.df_container)
+        self.lbl_diff.pack(expand=True)
+
+        # カード: グラフ
+        card_gr = self._card(self.main, '差分グラフ', row=1, col=2)
+        self.canvas_mpl = FigureCanvasTkAgg(self.fig, master=card_gr)
+        self.canvas_mpl.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.canvas_mpl.draw()
+
+        # 操作パネル（折りたたみ対象）
+        self.panel = ttk.Frame(self.main, padding=(8, 4))
+        self.panel.grid(row=0, column=0, columnspan=3, sticky='ew')
         
-        diff_percentage, diff_image = compare_images(self.seal_image, current_monitored_area)
+        # 荒らしレベル設定
+        for i, (thr, name) in enumerate(VANDALISM_LEVELS):
+            ttk.Label(self.panel, text=f'{name} (%)').grid(row=0, column=i*2, sticky='w')
+            ent = ttk.Entry(self.panel, textvariable=self.threshold_vars[i], width=6)
+            ent.grid(row=0, column=i*2+1, sticky='w', padx=(4, 12))
+            ent.config(validate='key', validatecommand=(self.root.register(self._vc_float_0_100), '%P'))
+            
+        ttk.Label(self.panel, text='間隔(秒)').grid(row=0, column=len(VANDALISM_LEVELS)*2, sticky='w')
+        self.ent_iv = ttk.Entry(self.panel, textvariable=self.check_interval_var, width=6)
+        self.ent_iv.grid(row=0, column=len(VANDALISM_LEVELS)*2+1, sticky='w', padx=(4, 12))
+        self.ent_iv.config(validate='key', validatecommand=(self.root.register(self._vc_pos_int), '%P'))
+        
+        ttk.Label(self.panel, text='拡大希望').grid(row=1, column=0, sticky='w')
+        self.scl_scale = ttk.Scale(self.panel, from_=1, to=20, orient='horizontal', command=self._on_scale_change)
+        self.scl_scale.set(self.scale_preference.get())
+        self.scl_scale.grid(row=1, column=1, columnspan=len(VANDALISM_LEVELS)*2+1, sticky='ew', padx=(4, 12))
+        
+        ttk.Label(self.panel, text='描画').grid(row=2, column=0, sticky='w')
+        self.cmb_render = ttk.Combobox(self.panel, state='readonly', values=['Pixel-Perfect', 'Smooth'])
+        self.cmb_render.set(self.render_mode_var.get())
+        self.cmb_render.bind('<<ComboboxSelected>>', lambda e: self.render_mode_var.set(self.cmb_render.get()))
+        self.cmb_render.grid(row=2, column=1, sticky='w', padx=(4, 12))
+        
+        self.chk_enh = ttk.Checkbutton(self.panel, text='差分強調', variable=self.enhance_diff_var)
+        self.chk_enh.grid(row=2, column=2, sticky='w')
 
-        # 画像をリサイズしてからTkinter用に変換
-        # Image.LANCZOS は高品質なリサイズアルゴリズム
-        resized_realtime_image = current_monitored_area.resize(self.DISPLAY_IMAGE_SIZE, Image.LANCZOS)
-        resized_diff_image = diff_image.resize(self.DISPLAY_IMAGE_SIZE, Image.LANCZOS)
+        # ステータスバー（折りたたみ対象）
+        self.status = ttk.Frame(self.root, padding=(12, 6))
+        self.status.grid(row=2, column=0, sticky='ew')
+        self.status.grid_columnconfigure(1, weight=1)
+        self.lbl_status = ttk.Label(self.status, textvariable=self.status_var, style='Status.TLabel')
+        self.lbl_status.grid(row=0, column=0, sticky='w')
+        ttk.Label(self.status, text='稼働:').grid(row=0, column=2, sticky='e', padx=(12, 2))
+        ttk.Label(self.status, textvariable=self.uptime_var).grid(row=0, column=3, sticky='e')
+        ttk.Label(self.status, text=' / 検知回数:').grid(row=0, column=4, sticky='e', padx=(8, 2))
+        self.lbl_cnt = ttk.Label(self.status, text=str(self.total_detections))
+        self.lbl_cnt.grid(row=0, column=5, sticky='e')
+        ttk.Label(self.status, text=' / 最終検知:').grid(row=0, column=6, sticky='e', padx=(8, 2))
+        ttk.Label(self.status, textvariable=self.last_detection_time).grid(row=0, column=7, sticky='e')
+        
+        ttk.Label(self.root, text=r"制作者 : GOLD.add(ゴリ).append(鍵は掛けとこうね) + [ChatGPT, Gemini]", style='TLabel').grid(row=3, column=0, pady=5)
 
-        realtime_tk = ImageTk.PhotoImage(resized_realtime_image)
-        diff_tk = ImageTk.PhotoImage(resized_diff_image)
 
-        # GUIの画像を更新
-        self.realtime_image_label.config(image=realtime_tk)
-        self.realtime_image_label.image = realtime_tk
-        self.diff_image_label.config(image=diff_tk)
-        self.diff_image_label.image = diff_tk
+        # 差分%の大型オーバーレイ（トップ中央）
+        self.overlay = ttk.Label(self.root, text='0.00 %', style='Pct.TLabel')
+        self.overlay.configure(foreground='#ffffff')
+        self.overlay.place(in_=self.main, relx=0.5, rely=0.02, anchor='n')
 
-        # ステータスを更新
-        if diff_percentage > current_threshold:
-            self.status_label.config(foreground="red")
-            self.status_var.set(f"!!!!!! 荒らしを検知 !!!!!! ({diff_percentage:.2f}%) ")
-        else:
-            self.status_label.config(foreground="white") # 黒背景なので白文字
-            self.status_var.set(f"監視中... (差分: {diff_percentage:.2f}%)")
+    def _card(self, parent, title, row, col):
+        frame = ttk.Frame(parent, style='Card.TFrame', padding=6)
+        frame.grid(row=row, column=col, sticky='nsew', padx=6, pady=6)
+        parent.grid_rowconfigure(row, weight=1)
+        parent.grid_columnconfigure(col, weight=1)
+        ttk.Label(frame, text=title, style='CardTitle.TLabel').pack(anchor='w', padx=6, pady=(2, 0))
+        return frame
 
-        # グラフデータを更新
-        current_time = time.time() - self.start_time
-        self.time_history.append(current_time)
-        self.diff_history.append(diff_percentage)
-
-        # 過去60秒間のデータのみ表示
-        window_start_time = current_time - 60
-        self.time_history = [t for t in self.time_history if t >= window_start_time]
-        self.diff_history = self.diff_history[-len(self.time_history):] # time_historyと同期
-
-        self.ax.clear()
-        self.ax.plot(self.time_history, self.diff_history, color='green')
+    def _style_matplotlib(self):
         self.ax.set_title("差分パーセンテージの推移", color='white')
         self.ax.set_xlabel("時間 (秒)", color='white')
         self.ax.set_ylabel("差分 (%)", color='white')
         self.ax.set_ylim(0, 100)
-        self.ax.set_xlim(max(0, window_start_time), current_time + 5) # 現在時刻より少し先まで表示
+        self.ax.set_facecolor('#0f1115')
+        self.fig.patch.set_facecolor('#0f1115')
+        for s in self.ax.spines.values():
+            s.set_color('white')
         self.ax.tick_params(axis='x', colors='white')
         self.ax.tick_params(axis='y', colors='white')
-        self.ax.spines['bottom'].set_color('white')
-        self.ax.spines['top'].set_color('white')
-        self.ax.spines['right'].set_color('white')
-        self.ax.spines['left'].set_color('white')
-        self.canvas.draw()
+        self.ax.grid(color='#444444', linestyle=':', linewidth=0.5)
 
-        # 次のチェックを予約
-        self.root.after(int(current_check_interval_ms), self.perform_check)
+    # ---------- 機能 ----------
+    def _load_seal(self):
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            base_dir = os.getcwd()
+        path = os.path.join(base_dir, SEAL_IMAGE_PATH)
+        if not os.path.exists(path):
+            print(f"[file] 原本が見つかりません: {path}")
+            return None
+        try:
+            img = Image.open(path).convert('RGB')
+            return img.crop(SEAL_CROP)
+        except Exception as e:
+            print(f"[file] 原本読み込みエラー: {e}")
+            return None
 
-    def update_uptime_display(self):
-        # 稼働時間を更新して表示
-        elapsed_time = int(time.time() - self.start_time)
-        hours = elapsed_time // 3600
-        minutes = (elapsed_time % 3600) // 60
-        seconds = elapsed_time % 60
-        self.uptime_var.set(f"{hours:02}:{minutes:02}:{seconds:02}")
-        self.root.after(1000, self.update_uptime_display) # 1秒ごとに更新
+    def toggle_fullscreen(self, event=None):
+        self.is_fullscreen = not self.is_fullscreen
+        if self.is_fullscreen:
+            self.windowed_geometry = self.root.geometry()
+            self.root.attributes('-fullscreen', True)
+        else:
+            self.root.attributes('-fullscreen', False)
+            if self.windowed_geometry:
+                self.root.geometry(self.windowed_geometry)
+        self.root.after(10, self._render_current) # 描画遅延に対応
+        return 'break'
 
-if __name__ == "__main__":
+    def exit_fullscreen(self, event=None):
+        if self.is_fullscreen:
+            self.is_fullscreen = False
+            self.root.attributes('-fullscreen', False)
+            if self.windowed_geometry:
+                self.root.geometry(self.windowed_geometry)
+        self.root.after(10, self._render_current)
+        return 'break'
+
+    def toggle_focus_mode(self, event=None):
+        self.focus_mode = not self.focus_mode
+        if self.focus_mode:
+            self.header.grid_remove()
+            self.panel.grid_remove()
+            self.status.grid_remove()
+            self.root.grid_rowconfigure(1, weight=1)
+            self.overlay.configure(style='PctBig.TLabel')
+        else:
+            self.header.grid()
+            self.panel.grid()
+            self.status.grid()
+            self.root.grid_rowconfigure(1, weight=1)
+            self.overlay.configure(style='Pct.TLabel')
+        self.root.after(10, self._render_current)
+        return 'break'
+
+    def _set_status_color(self, color):
+        if hasattr(self, 'dot'):
+            self.dot.configure(foreground=color)
+
+    def _tick_uptime(self):
+        elapsed = int(time.time() - self.start_time)
+        h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+        self.uptime_var.set(f"{h:02}:{m:02}:{s:02}")
+        self.root.after(1000, self._tick_uptime)
+
+    def _vc_float_0_100(self, p):
+        if p == '':
+            return True
+        try:
+            v = float(p)
+            return 0.0 <= v <= 100.0
+        except ValueError:
+            return False
+
+    def _vc_pos_int(self, p):
+        if p == '':
+            return True
+        try:
+            return int(p) > 0
+        except ValueError:
+            return False
+
+    def _on_scale_change(self, _):
+        self.scale_preference.set(int(float(self.scl_scale.get())))
+        self._render_current()
+
+    # ---------- レイアウト変化での再描画 ----------
+    def _on_any_configure(self, event):
+        self.root.after(10, self._render_current)
+
+    def _effective_disp_size(self):
+        w_rt = max(1, self.rt_container.winfo_width() - 16)
+        h_rt = max(1, self.rt_container.winfo_height() - 16)
+        w_df = max(1, self.df_container.winfo_width() - 16)
+        h_df = max(1, self.df_container.winfo_height() - 16)
+        w = max(1, min(w_rt, w_df))
+        h = max(1, min(h_rt, h_df))
+
+        sx = w / self.base_w
+        sy = h / self.base_h
+        s = max(1.0, min(sx, sy))
+        s = min(s, float(self.scale_preference.get()))
+
+        if self.render_mode_var.get() == 'Pixel-Perfect':
+            s = max(1, int(s))
+        
+        disp_w = max(1, int(self.base_w * s))
+        disp_h = max(1, int(self.base_h * s))
+        return (disp_w, disp_h)
+
+    # ---------- 監視ループ（非ブロッキング） ----------
+    def perform_check(self):
+        try:
+            interval_ms = int(float(self.check_interval_var.get())) * 1000
+            if interval_ms <= 0:
+                interval_ms = 1000
+        except (ValueError, IndexError):
+            interval_ms = 1000
+
+        if self.monitoring:
+            threading.Thread(target=self._fetch_and_update, daemon=True).start()
+        self.root.after(interval_ms, self.perform_check)
+
+    def _fetch_and_update(self):
+        tile = get_image_from_url(TILE_URL)
+        if tile is None:
+            self.root.after(0, lambda: self.status_var.set('エラー: タイル画像取得失敗'))
+            return
+
+        area = tile.crop(MONITOR_CROP)
+        diff_pct, diff_img = compare_images(self.seal_image, area)
+        self._last_area = area
+        self._last_diff = diff_img
+
+        self.root.after(0, lambda: self._update_ui(diff_pct))
+
+    # ---------- 画像更新 & グラフ ----------
+    def _render_current(self):
+        if self._last_area is None or self._last_diff is None:
+            return
+        
+        disp_size = self._effective_disp_size()
+        mode = self.render_mode_var.get()
+        resample = Image.NEAREST if mode == 'Pixel-Perfect' else Image.LANCZOS
+
+        shown_rt = self._last_area.resize(disp_size, resample)
+        shown_df = self._last_diff
+        if self.enhance_diff_var.get():
+            shown_df = ImageOps.autocontrast(shown_df, cutoff=2)
+            shown_df = ImageEnhance.Contrast(shown_df).enhance(1.4)
+        shown_df = shown_df.resize(disp_size, resample)
+
+        self.photo_realtime = ImageTk.PhotoImage(shown_rt)
+        self.photo_diff = ImageTk.PhotoImage(shown_df)
+        self.lbl_rt.configure(image=self.photo_realtime)
+        self.lbl_diff.configure(image=self.photo_diff)
+
+    def _update_ui(self, diff_pct: float):
+        self._render_current()
+        self.overlay.configure(text=f"{diff_pct:.2f} %")
+
+        # 荒らしレベル判定
+        level_name = "監視中"
+        status_msg = f"監視中... (差分: {diff_pct:.2f}%)"
+        status_color = self.COLORS['green']
+        overlay_color = '#ffffff'
+        is_detection = False
+        
+        try:
+            thresholds = sorted([float(v.get()) for v in self.threshold_vars])
+        except ValueError:
+            thresholds = sorted([v[0] for v in VANDALISM_LEVELS])
+
+        for thr, name in reversed(list(zip(thresholds, [v[1] for v in VANDALISM_LEVELS]))):
+            if diff_pct >= thr:
+                level_name = name
+                is_detection = True
+                break
+        
+        if is_detection:
+            status_msg = f"!!!!!! 荒らしを検知 !!!!!! ({level_name}, 差分: {diff_pct:.2f}%)"
+            status_color = self.COLORS['red']
+            overlay_color = '#ff5252'
+            self.total_detections += 1
+            self.lbl_cnt.configure(text=str(self.total_detections))
+            self.last_detection_time.set(dt.datetime.now().strftime('%H:%M:%S'))
+            
+        self.status_var.set(status_msg)
+        self._set_status_color(status_color)
+        self.overlay.configure(foreground=overlay_color)
+
+        # グラフ更新
+        t = time.time() - self.start_time
+        self.time_history.append(t)
+        self.diff_history.append(diff_pct)
+        t0 = t - 60
+        while self.time_history and self.time_history[0] < t0:
+            self.time_history.pop(0); self.diff_history.pop(0)
+        self.ax.clear(); self._style_matplotlib()
+        self.ax.plot(self.time_history, self.diff_history, color='cyan')
+        
+        # グラフにしきい値線を追加
+        thresholds = sorted([float(v.get()) for v in self.threshold_vars], reverse=False)
+        for thr, name in list(zip(thresholds, [v[1] for v in VANDALISM_LEVELS])):
+            self.ax.axhline(y=thr, linestyle='--', color='red', alpha=0.5, label=f"{name}しきい値")
+
+        self.ax.set_xlim(max(0, t0), t + 5)
+        self.ax.legend(facecolor='#0f1115', edgecolor='white', labelcolor='white')
+        self.canvas_mpl.draw()
+
+    # ---------- 致命的エラー ----------
+    def _fatal(self, msg):
+        top = tk.Toplevel(self.root)
+        top.title('エラー')
+        ttk.Label(top, text=msg, foreground=self.COLORS['red']).pack(padx=20, pady=20)
+        ttk.Button(top, text='閉じる', command=self.root.destroy).pack(pady=(0, 12))
+
+if __name__ == '__main__':
     root = tk.Tk()
     app = VandalismDetectorApp(root)
     root.mainloop()
